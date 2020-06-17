@@ -6,11 +6,14 @@
     {
         protected $configServer; //apollo服务端地址
         protected $appId; //apollo配置项目的appid
-        protected $cluster         = 'default';
-        protected $clientIp        = '127.0.0.1'; //绑定IP做灰度发布用
-        protected $notifications   = [];
-        protected $pullTimeout     = 10; //获取某个namespace配置的请求超时时间
-        protected $intervalTimeout = 0; //每次请求获取apollo配置变更时的超时时间
+        protected $cluster                 = 'default';
+        protected $clientIp                = '127.0.0.1'; //绑定IP做灰度发布用
+        protected $notifications           = [];
+        protected $pullTimeout             = 10; //获取某个namespace配置的请求超时时间
+        protected $intervalTimeout         = 0; //每次请求获取apollo配置变更时的超时时间
+        protected $writeToConfigFile       = FALSE; //是否写到配置文件，默认不写
+        protected $namespaces              = []; //监控的命名的空间。
+        protected $updateResponseAllConfig = FALSE; //配置更新返回完整配置还是只返回更新的配置，默认只返回更新了的日志。
         public    $save_dir; //配置保存目录
 
         /**
@@ -24,6 +27,7 @@
         {
             $this->configServer = $configServer;
             $this->appId        = $appId;
+            $this->namespaces   = $namespaces;
             foreach ($namespaces as $namespace) {
                 $this->notifications[ $namespace ] = ['namespaceName' => $namespace, 'notificationId' => -1];
             }
@@ -50,6 +54,16 @@
         {
             $intervalTimeout       = intval($intervalTimeout);
             $this->intervalTimeout = $intervalTimeout;
+        }
+
+        public function setWriteToConfigFile($isWrite)
+        {
+            $this->writeToConfigFile = $isWrite;
+        }
+
+        public function setUpdateResponseAllConfig($updateResponseAllConfig)
+        {
+            $this->updateResponseAllConfig = $updateResponseAllConfig;
         }
 
         private function _getReleaseKey($config_file)
@@ -92,7 +106,10 @@
             curl_close($ch);
 
             if ($httpCode == 200) {
-                file_put_contents($config_file, $body);
+                if ($this->writeToConfigFile) {
+                    file_put_contents($config_file, $body);
+                }
+                return $body;
             } elseif ($httpCode != 304) {
                 echo $body ?: $error . "\n";
                 return FALSE;
@@ -103,7 +120,10 @@
         //获取多个namespace的配置-无缓存的方式
         public function pullConfigBatch(array $namespaceNames)
         {
-            if (!$namespaceNames) return [];
+            if (!$namespaceNames) {
+                $namespaceNames = $this->namespaces;
+            }
+
             $multi_ch         = curl_multi_init();
             $request_list     = [];
             $base_url         = rtrim($this->configServer, '/') . '/configfiles/' . $this->appId . '/' . $this->cluster . '/';
@@ -152,7 +172,10 @@
                 curl_multi_remove_handle($multi_ch, $req['ch']);
                 curl_close($req['ch']);
                 if ($code == 200) {
-                    file_put_contents($req['config_file'], $result);
+                    if ($this->writeToConfigFile) {
+                        file_put_contents($req['config_file'], $result);
+                    }
+                    $response_list[ $namespaceName ] = $result;
                 } elseif ($code != 304) {
                     echo 'pull config of namespace[' . $namespaceName . '] error:' . ($result ?: $error) . "\n";
                     $response_list[ $namespaceName ] = FALSE;
@@ -183,12 +206,20 @@
                             $change_list[ $r['namespaceName'] ] = $r['notificationId'];
                         }
                     }
-                    $response_list = $this->pullConfigBatch(array_keys($change_list));
-                    foreach ($response_list as $namespaceName => $result) {
-                        $result && ($this->notifications[ $namespaceName ]['notificationId'] = $change_list[ $namespaceName ]);
+
+                    if ($this->updateResponseAllConfig) {
+                        $response_list = $this->pullConfigBatch($this->namespaces);
+                    } else {
+                        $response_list = $this->pullConfigBatch(array_keys($change_list));
                     }
+
+                    foreach ($response_list as $namespaceName => $result) {
+                        $result && array_key_exists($namespaceName, $change_list)
+                        && ($this->notifications[ $namespaceName ]['notificationId'] = $change_list[ $namespaceName ]);
+                    }
+
                     //如果定义了配置变更的回调，比如重新整合配置，则执行回调
-                    ($callback instanceof \Closure) && call_user_func($callback, $response_list);
+                    ($callback instanceof \Closure) && call_user_func($callback, $this, $response_list);
                 } elseif ($httpCode != 304) {
                     throw new \Exception($response ?: $error);
                 }
